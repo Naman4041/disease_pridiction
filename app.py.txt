@@ -1,0 +1,287 @@
+import numpy as np
+import pandas as pd
+import os
+import warnings
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+import streamlit as st
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+
+warnings.filterwarnings("ignore")
+
+# =========================
+# Streamlit Page Config
+# =========================
+st.set_page_config(
+    page_title="Disease Prediction from Symptoms",
+    layout="wide",
+)
+
+st.title("🩺 Disease Prediction from Symptoms")
+st.caption("ML-based toy project — **not** a real medical diagnostic tool.")
+
+# =========================
+# 1. Load Dataset (with Kaggle path + upload fallback)
+# =========================
+@st.cache_data
+def load_dataset():
+    dataset_path = None
+    for dirname, _, filenames in os.walk("/kaggle/input"):
+        for filename in filenames:
+            if filename.lower() == "training.csv":
+                dataset_path = os.path.join(dirname, filename)
+
+    if dataset_path is not None:
+        df = pd.read_csv(dataset_path)
+        return df
+    else:
+        return None
+
+df = load_dataset()
+
+if df is None:
+    st.warning("Could not auto-find `Training.csv`. Upload it manually:")
+    uploaded = st.file_uploader("Upload Training.csv", type=["csv"])
+    if uploaded is not None:
+        df = pd.read_csv(uploaded)
+    else:
+        st.stop()  # stop the app until data is provided
+
+# Remove unnamed columns if any
+df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
+
+# Basic info
+num_symptoms = df.shape[1] - 1
+num_diseases = df["prognosis"].nunique()
+missing_vals = int(df.isnull().sum().sum())
+
+# =========================
+# Sidebar: Dataset Info
+# =========================
+st.sidebar.header("📊 Dataset Info")
+st.sidebar.write(f"**Symptoms (features):** {num_symptoms}")
+st.sidebar.write(f"**Unique diseases (labels):** {num_diseases}")
+st.sidebar.write(f"**Missing values:** {missing_vals}")
+
+if st.sidebar.checkbox("Show raw data"):
+    st.sidebar.dataframe(df.head())
+
+# =========================
+# 2. Visualization
+# =========================
+with st.expander("📈 Show Disease Distribution Plot"):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sns.countplot(
+        y="prognosis",
+        data=df,
+        order=df["prognosis"].value_counts().index,
+        ax=ax,
+    )
+    ax.set_title("Disease Count Distribution")
+    plt.tight_layout()
+    st.pyplot(fig)
+
+# =========================
+# 3. Train-Test Split
+# =========================
+X = df.drop("prognosis", axis=1)
+y = df["prognosis"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y,  # helps with unbalanced classes
+)
+
+# =========================
+# 4. Model + 10-Fold Cross Validation
+# =========================
+@st.cache_resource
+def train_model(X, y, X_train, y_train, X_test, y_test):
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    # 10-fold CV
+    cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+    cv_scores = cross_val_score(
+        model, X, y, cv=cv, scoring="accuracy", n_jobs=-1
+    )
+
+    # Fit on train split for final evaluation & prediction
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    test_acc = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, output_dict=False)
+
+    return model, cv_scores, test_acc, y_pred, report
+
+with st.spinner("Training RandomForest model and running 10-fold CV..."):
+    model, cv_scores, test_acc, y_pred, report_txt = train_model(
+        X, y, X_train, y_train, X_test, y_test
+    )
+
+# =========================
+# 5. Show Evaluation Metrics
+# =========================
+col1, col2, col3 = st.columns(3)
+col1.metric("Mean CV Accuracy (10-fold)", f"{cv_scores.mean():.3f}")
+col2.metric("CV Std Dev", f"{cv_scores.std():.3f}")
+col3.metric("Test Accuracy (hold-out)", f"{test_acc:.3f}")
+
+with st.expander("📄 Full Classification Report"):
+    st.text(report_txt)
+
+with st.expander("🧩 Confusion Matrix"):
+    fig_cm, ax_cm = plt.subplots(figsize=(8, 6))
+    cm = confusion_matrix(y_test, y_pred, labels=df["prognosis"].unique())
+    sns.heatmap(cm, annot=False, cmap="Blues", ax=ax_cm)
+    ax_cm.set_xlabel("Predicted")
+    ax_cm.set_ylabel("True")
+    ax_cm.set_title("Confusion Matrix")
+    plt.tight_layout()
+    st.pyplot(fig_cm)
+
+# =========================
+# 6. Symptom-based Prediction UI
+# =========================
+st.markdown("---")
+st.header("🔮 Predict Disease from Symptoms")
+
+# Get list of symptoms from dataset
+symptoms_list = X.columns.tolist()
+
+st.markdown("Select one or more symptoms, then click **Predict**.")
+
+selected_symptoms = st.multiselect(
+    "Select symptoms:",
+    options=symptoms_list,
+    help="These are the symptom columns from your dataset."
+)
+
+clicked = st.button("Predict")
+
+if clicked:
+    if not selected_symptoms:
+        st.warning("Please select at least one symptom.")
+    else:
+        try:
+            # Build input vector
+            input_vec = np.zeros(len(symptoms_list))
+            for i, s in enumerate(symptoms_list):
+                if s in selected_symptoms:
+                    input_vec[i] = 1
+
+            # Just to be sure:
+            st.write("✅ Symptoms selected:", ", ".join(selected_symptoms))
+
+            # Prediction
+            prediction = model.predict([input_vec])[0]
+
+            # Some RandomForest versions need predict_proba check
+            if hasattr(model, "predict_proba"):
+                probs = model.predict_proba([input_vec])[0]
+                classes = model.classes_
+
+                top_idx = np.argsort(probs)[-3:][::-1]
+                top_diseases = [(classes[i], probs[i]) for i in top_idx]
+            else:
+                probs = None
+                top_diseases = []
+
+            st.subheader("🩺 Predicted disease")
+            st.success(str(prediction))
+
+            if probs is not None:
+                st.subheader("🔍 Top possible diseases")
+                for disease, p in top_diseases:
+                    st.write(f"- **{disease}** — {p*100:.2f}%")
+
+                with st.expander("📊 All disease probabilities"):
+                    prob_df = pd.DataFrame({
+                        "disease": classes,
+                        "probability": probs
+                    }).sort_values("probability", ascending=False)
+                    st.bar_chart(prob_df.set_index("disease"))
+
+        except Exception as e:
+            st.error(f"❌ Something went wrong while predicting: {e}")
+symptoms_list = X.columns.tolist()
+
+st.markdown("Select one or more symptoms, then click **Predict**.")
+
+selected_symptoms = st.multiselect(
+    "Select symptoms:",
+    options=symptoms_list,
+    help="These are the symptom columns from your dataset."
+)
+
+clicked = st.button("Predict")
+
+if clicked:
+    if not selected_symptoms:
+        st.warning("Please select at least one symptom.")
+    else:
+        try:
+            # Build input vector
+            input_vec = np.zeros(len(symptoms_list))
+            for i, s in enumerate(symptoms_list):
+                if s in selected_symptoms:
+                    input_vec[i] = 1
+
+            # Just to be sure:
+            st.write("✅ Symptoms selected:", ", ".join(selected_symptoms))
+
+            # Prediction
+            prediction = model.predict([input_vec])[0]
+
+            # Some RandomForest versions need predict_proba check
+            if hasattr(model, "predict_proba"):
+                probs = model.predict_proba([input_vec])[0]
+                classes = model.classes_
+
+                top_idx = np.argsort(probs)[-3:][::-1]
+                top_diseases = [(classes[i], probs[i]) for i in top_idx]
+            else:
+                probs = None
+                top_diseases = []
+
+            st.subheader("🩺 Predicted disease")
+            st.success(str(prediction))
+
+            if probs is not None:
+                st.subheader("🔍 Top possible diseases")
+                for disease, p in top_diseases:
+                    st.write(f"- **{disease}** — {p*100:.2f}%")
+
+                with st.expander("📊 All disease probabilities"):
+                    prob_df = pd.DataFrame({
+                        "disease": classes,
+                        "probability": probs
+                    }).sort_values("probability", ascending=False)
+                    st.bar_chart(prob_df.set_index("disease"))
+
+        except Exception as e:
+            st.error(f"❌ Something went wrong while predicting: {e}")
+
+        # Optional: probability bar chart
+        with st.expander("📊 Show probability distribution for all diseases"):
+            prob_df = pd.DataFrame(
+                {"disease": classes, "probability": probabilities}
+            ).sort_values("probability", ascending=False)
+            st.bar_chart(prob_df.set_index("disease"))
+
+# =========================
+# 7. Disclaimer
+# =========================
+st.markdown(
+    """
+    ---
+    ⚠️ **Disclaimer:**  
+    This project is for **educational/demo purposes only** and is **not** a substitute for professional medical advice, diagnosis, or treatment.
+    """
+)
